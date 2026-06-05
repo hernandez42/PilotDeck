@@ -29,6 +29,7 @@ import { AlwaysOnRunContextRegistry } from "./AlwaysOnRunContextRegistry.js";
 import { ChannelLeaseRegistry } from "./ChannelLeaseRegistry.js";
 import { DiscoveryFire, type DiscoveryFireDependencies } from "./DiscoveryFire.js";
 import { DiscoveryScheduler } from "./DiscoveryScheduler.js";
+import { AlwaysOnRetention } from "./AlwaysOnRetention.js";
 import { SessionConfigOverrides } from "./SessionConfigOverrides.js";
 import type { TelemetryClient } from "../../telemetry/index.js";
 
@@ -233,8 +234,61 @@ export class AlwaysOnRuntime {
     if (!this.scheduler) {
       throw new Error("AlwaysOnRuntime.start called before bindGateway.");
     }
+    // Best-effort retention cleanup — never blocks startup
+    this.runRetentionCleanup();
     await this.scheduler.start();
     this.logger.info("always-on runtime started", { projectKey: this.projectKey });
+  }
+
+  private runRetentionCleanup(): void {
+    const retentionConfig = this.config.workspace.retention;
+    if (!retentionConfig?.enabled) return;
+    try {
+      const retention = new AlwaysOnRetention({
+        workspaceRoot: this.paths.rootDir,
+        policy: {
+          retentionDays: retentionConfig.retentionDays ?? 14,
+          maxRetainedWorkspaces: retentionConfig.maxRetainedWorkspaces ?? 8,
+        },
+        protectedWorkspaceIds: this.collectActiveWorkspaceIds(),
+        protectedCwds: this.collectActiveCwds(),
+        now: this.now,
+      });
+      const { deleted, errors } = retention.run();
+      if (deleted.length > 0) {
+        this.logger.info(`[always-on] retention cleaned up ${deleted.length} workspace(s)`, { deleted, errors });
+      } else if (errors.length > 0) {
+        this.logger.warn("[always-on] retention had errors", { errors });
+      }
+    } catch (err) {
+      // Best-effort — never block startup
+      this.logger.warn("[always-on] retention cleanup failed", { error: String(err) });
+    }
+  }
+
+  private collectActiveWorkspaceIds(): Set<string> {
+    const ids = new Set<string>();
+    try {
+      const index = this.cycleStore.readIndex();
+      for (const cycle of index.cycles) {
+        if (cycle.status === "active" || cycle.status === "applying" || cycle.status === "applied") {
+          // The workspace ID is the last path segment of the cwd
+          const parts = cycle.cwd.split("/");
+          if (parts.length > 0) ids.add(parts[parts.length - 1]);
+        }
+      }
+    } catch { /* best-effort */ }
+    return ids;
+  }
+
+  private collectActiveCwds(): Set<string> {
+    const cwds = new Set<string>();
+    try {
+      for (const ctx of this.runContexts.list()) {
+        if (ctx.cwd) cwds.add(ctx.cwd);
+      }
+    } catch { /* best-effort */ }
+    return cwds;
   }
 
   async stop(): Promise<void> {
